@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Egesha Smart Parking</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Palette: asphalt, road-marking yellow, bay-line white, free green, taken red */
+:root{--road:#1f2428;--road2:#2a3036;--line:#f3f1ea;--yellow:#f2c230;--free:#3fae6a;--taken:#c8453b;--muted:#9aa3ab}
+*{box-sizing:border-box}
+body{margin:0;background:var(--road);color:var(--line);font:16px/1.5 Barlow,Arial,sans-serif}
+h1,h2,.big{font-family:"Barlow Condensed","Arial Narrow",sans-serif;font-weight:700;margin:0}
+header{padding:20px 16px;border-bottom:4px dashed var(--yellow);display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
+h1{font-size:2.2rem;color:var(--yellow)} header p{margin:0;color:var(--muted)}
+.big{font-size:4.5rem;line-height:1} .big small{font-size:1.2rem;color:var(--muted);font-weight:600}
+main{max-width:1100px;margin:auto;padding:16px;display:grid;gap:20px;grid-template-columns:1fr}
+@media(min-width:900px){main{grid-template-columns:1.4fr 1fr}}
+.card{background:var(--road2);padding:16px;border-radius:6px}
+/* Bay grid: painted stalls, vertical white lines between them */
+.bays{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:0;margin-top:12px}
+.bay{height:84px;border:2px solid var(--line);border-top:0;margin-left:-2px;display:flex;flex-direction:column;justify-content:center;align-items:center;font-family:"Barlow Condensed",sans-serif;font-size:1.3rem;font-weight:700}
+.bay span{font:500 .7rem Barlow,sans-serif}
+.bay.free{color:var(--free)} .bay.taken{background:rgba(200,69,59,.25);color:var(--taken)}
+.zone{color:var(--muted);margin:14px 0 0;font-weight:500}
+label{display:block;margin:10px 0 4px;color:var(--muted)}
+input{width:100%;padding:12px;font:600 1.2rem "Barlow Condensed",sans-serif;background:var(--road);color:var(--line);border:2px solid var(--muted);border-radius:4px;text-transform:uppercase}
+input:focus,button:focus-visible{outline:3px solid var(--yellow);outline-offset:2px}
+button{margin-top:10px;width:100%;padding:12px;font:700 1.1rem "Barlow Condensed",sans-serif;background:var(--yellow);color:var(--road);border:0;border-radius:4px;cursor:pointer}
+#msg{min-height:3em;margin-top:12px;padding:10px;border-left:4px solid var(--muted)} #msg.ok{border-color:var(--free)} #msg.err{border-color:var(--taken)}
+/* Barrier arm: rotates up when open */
+.gate{height:14px;width:100%;margin-top:12px;background:repeating-linear-gradient(45deg,var(--yellow) 0 14px,var(--road) 14px 28px);transform-origin:left;transition:transform .8s}
+.gate.open{transform:rotate(-40deg)}
+table{width:100%;border-collapse:collapse;font-size:.95rem} td{padding:4px 0;border-bottom:1px solid #3a4148}
+@media(prefers-reduced-motion:reduce){.gate{transition:none}}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Egesha Smart Parking</h1><p>Check for a free bay before you drive in.</p></div>
+  <div class="big"><span id="free">–</span> <small>bays free of <span id="total">–</span></small></div>
+</header>
+<main>
+  <section class="card" aria-label="Bay availability">
+    <h2>Live bay availability</h2>
+    <p class="zone">Zone A</p><div class="bays" id="bayA"></div>
+    <p class="zone">Zone B</p><div class="bays" id="bayB"></div>
+  </section>
+  <section>
+    <div class="card">
+      <h2>Entry</h2>
+      <label for="inPlate">Number plate</label><input id="inPlate" placeholder="KDA 123A" maxlength="9">
+      <button onclick="enter()">Get ticket</button>
+      <h2 style="margin-top:22px">Exit</h2>
+      <label for="outPlate">Number plate</label><input id="outPlate" placeholder="KDA 123A" maxlength="9">
+      <button onclick="bill()">Get bill</button>
+      <div id="payBox" hidden>
+        <label for="phone">M-Pesa number</label><input id="phone" placeholder="0712345678" maxlength="12">
+        <button onclick="pay()">Pay and open barrier</button>
+      </div>
+      <div id="msg" role="status">Ready.</div>
+      <div class="gate" id="gate" aria-label="Barrier"></div>
+    </div>
+    <div class="card" style="margin-top:20px">
+      <h2>Parking fees</h2><table id="tariff"></table>
+      <h2 style="margin-top:16px">Today: Kshs. <span id="rev">0</span></h2>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let owed = null;                                   // plate waiting for payment
+
+// POST helper: returns parsed JSON, throws Error(message) on failure
+async function post(url, body){
+  const r = await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d = await r.json(); if(!r.ok) throw new Error(d.error); return d;
+}
+function say(text, kind){ $("msg").textContent = text; $("msg").className = kind; }
+function barrier(){ $("gate").classList.add("open"); setTimeout(()=>$("gate").classList.remove("open"), 4000); }
+const hm = m => m >= 60 ? `${Math.floor(m/60)}h ${m%60}min` : `${m} min`;
+
+// Redraw bays, counts, tariffs (auto-refreshes every 5 s)
+async function refresh(){
+  const d = await (await fetch("/api/slots")).json();
+  $("free").textContent = d.free; $("total").textContent = d.total;
+  ["A","B"].forEach(z => $("bay"+z).innerHTML = d.slots.filter(s=>s.zone===z).map(s =>
+    `<div class="bay ${s.occupied?"taken":"free"}">${s.slot_id}<span>${s.occupied?"taken":"free"}</span></div>`).join(""));
+  $("tariff").innerHTML = d.tariffs.map((t,i) => `<tr><td>${t.max_minutes ? "Up to "+hm(t.max_minutes) : "Over "+hm(d.tariffs[i-1].max_minutes)}</td><td>${t.fee ? "Kshs. "+t.fee : "Free"}</td></tr>`).join("");
+  $("rev").textContent = (await (await fetch("/api/report")).json()).revenue_today;
+}
+async function enter(){
+  try{ const d = await post("/api/entry",{plate:$("inPlate").value});
+       say(`${d.plate}: go to bay ${d.slot}. Barrier open.`,"ok"); barrier(); $("inPlate").value=""; refresh();
+  }catch(e){ say(e.message,"err"); }
+}
+async function bill(){
+  try{ const d = await post("/api/bill",{plate:$("outPlate").value});
+       if(d.paid){ say(`${d.plate}: ${hm(d.minutes)}, no fee. Barrier open.`,"ok"); barrier(); refresh(); return; }
+       owed = d.plate; $("payBox").hidden = false;
+       say(`${d.plate} parked ${hm(d.minutes)} in bay ${d.slot}. Pay Kshs. ${d.fee} to exit.`,"ok");
+  }catch(e){ say(e.message,"err"); $("payBox").hidden = true; }
+}
+async function pay(){
+  try{ const d = await post("/api/pay",{plate:owed,phone:$("phone").value});
+       say(`Paid Kshs. ${d.fee} (ref ${d.reference}). Barrier open, drive safely.`,"ok");
+       barrier(); $("payBox").hidden = true; $("outPlate").value = ""; refresh();
+  }catch(e){ say(e.message,"err"); }
+}
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
